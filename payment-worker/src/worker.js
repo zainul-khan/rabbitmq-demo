@@ -1,200 +1,265 @@
 const amqp = require("amqplib");
 
-const RABBITMQ_URL =
-    "amqp://admin:admin@localhost:5672";
+const RABBITMQ_URL = "amqp://admin:admin@localhost:5672";
 
-
-/*
-|--------------------------------------------------------------------------
-| RabbitMQ Configuration
-|--------------------------------------------------------------------------
-*/
-
-const EXCHANGE_NAME = "orders.exchange";
-
-const QUEUE_NAME = "orders.payment";
-
+// Main
+const MAIN_EXCHANGE = "orders.exchange";
+const MAIN_QUEUE = "orders.payment";
 const ROUTING_KEY = "order.created";
 
+// Retry
+const RETRY_EXCHANGE = "orders.payment.retry.exchange";
+const RETRY_QUEUE = "orders.payment.retry";
+
+// DLQ
+const DLX_EXCHANGE = "orders.dlx";
+const DLQ_QUEUE = "orders.payment.dlq";
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 5000;
 
 async function startWorker() {
+    const connection = await amqp.connect(RABBITMQ_URL);
+    const channel = await connection.createChannel();
 
     /*
-     * 1. Connect to RabbitMQ
-     */
-    const connection =
-        await amqp.connect(RABBITMQ_URL);
-
-
-    /*
-     * 2. Create channel
-     */
-    const channel =
-        await connection.createChannel();
-
-
-    /*
-     * 3. Create exchange
-     *
-     * Exchange:
-     *
-     * orders.exchange
-     *
-     * Type:
-     *
-     * direct
+     * Main exchange
      */
     await channel.assertExchange(
-        EXCHANGE_NAME,
+        MAIN_EXCHANGE,
         "direct",
-        {
-            durable: true,
-        }
+        { durable: true }
     );
 
+    /*
+     * Retry exchange
+     */
+    await channel.assertExchange(
+        RETRY_EXCHANGE,
+        "direct",
+        { durable: true }
+    );
 
     /*
-     * 4. Create queue
+     * DLX exchange
+     */
+    await channel.assertExchange(
+        DLX_EXCHANGE,
+        "direct",
+        { durable: true }
+    );
+
+    /*
+     * Main payment queue
      *
-     * This is where messages will WAIT.
+     * If message is rejected,
+     * RabbitMQ sends it to RETRY_EXCHANGE.
      */
     await channel.assertQueue(
-        QUEUE_NAME,
+        MAIN_QUEUE,
+        {
+            durable: true,
+
+            arguments: {
+                "x-dead-letter-exchange": RETRY_EXCHANGE,
+                "x-dead-letter-routing-key": ROUTING_KEY,
+            },
+        }
+    );
+
+    /*
+     * Retry queue
+     *
+     * Message stays here for 5 seconds.
+     *
+     * After TTL expires, RabbitMQ sends
+     * it back to orders.exchange.
+     */
+    await channel.assertQueue(
+        RETRY_QUEUE,
+        {
+            durable: true,
+
+            arguments: {
+                "x-message-ttl": RETRY_DELAY,
+
+                "x-dead-letter-exchange": MAIN_EXCHANGE,
+                "x-dead-letter-routing-key": ROUTING_KEY,
+            },
+        }
+    );
+
+    /*
+     * DLQ
+     */
+    await channel.assertQueue(
+        DLQ_QUEUE,
         {
             durable: true,
         }
     );
 
-
     /*
-     * 5. Create BINDING
-     *
-     * This is the connection between:
-     *
-     * Exchange
-     *      ↓
-     * Queue
-     *
-     * And the routing key tells RabbitMQ
-     * which messages should go through.
+     * Main queue -> main exchange
      */
     await channel.bindQueue(
-        QUEUE_NAME,
-        EXCHANGE_NAME,
+        MAIN_QUEUE,
+        MAIN_EXCHANGE,
         ROUTING_KEY
     );
 
-
-    console.log("Connected to RabbitMQ");
-
-    console.log(
-        `Waiting for "${ROUTING_KEY}" messages...`
+    /*
+     * Retry queue -> retry exchange
+     */
+    await channel.bindQueue(
+        RETRY_QUEUE,
+        RETRY_EXCHANGE,
+        ROUTING_KEY
     );
-
 
     /*
-     * 6. Consume messages
+     * DLQ -> DLX
      */
-    channel.consume(
-        QUEUE_NAME,
-        async (message) => {
+    await channel.bindQueue(
+        DLQ_QUEUE,
+        DLX_EXCHANGE,
+        ROUTING_KEY
+    );
 
-            if (!message) {
-                return;
-            }
+    console.log("Payment Worker connected");
+    console.log("Waiting for payments...");
 
-            try {
+    channel.consume(MAIN_QUEUE, async (message) => {
+        if (!message) return;
 
-                const order =
-                    JSON.parse(
-                        message.content.toString()
-                    );
+        const order = JSON.parse(
+            message.content.toString()
+        );
 
+        const retryCount = getRetryCount(message);
+
+        console.log("\n-----------------------------");
+        console.log("Payment Worker received:");
+        console.log(order);
+
+        console.log(`Retry count: ${retryCount}`);
+
+        try {
+            await processPayment(order);
+
+            console.log("Payment successful");
+
+            channel.ack(message);
+
+        } catch (error) {
+
+            console.error(
+                "Payment failed:",
+                error.message
+            );
+
+            if (retryCount < MAX_RETRIES) {
 
                 console.log(
-                    "\n-----------------------------"
+                    `Retrying in ${RETRY_DELAY / 1000}s...`
                 );
-
-                console.log(
-                    "Payment Worker received:"
-                );
-
-                console.log(order);
-
 
                 /*
-                 * Simulate payment processing
-                 */
-                console.log(
-                    `Processing payment for ${order.orderId}...`
-                );
-
-
-                await processPayment(order);
-
-
-                console.log(
-                    `Payment successful for ${order.orderId}`
-                );
-
-
-                /*
-                 * Tell RabbitMQ:
+                 * false = don't acknowledge
+                 * false = don't requeue directly
                  *
-                 * "I successfully processed this message."
+                 * Because the queue has a DLX,
+                 * RabbitMQ sends it to retry queue.
+                 */
+                channel.nack(
+                    message,
+                    false,
+                    false
+                );
+
+            } else {
+
+                console.log(
+                    "Maximum retries reached."
+                );
+
+                /*
+                 * Send message to DLQ.
+                 */
+                channel.publish(
+                    DLX_EXCHANGE,
+                    ROUTING_KEY,
+                    message.content,
+                    {
+                        persistent: true,
+                        headers: {
+                            "x-final-retry-count": retryCount,
+                        },
+                    }
+                );
+
+                /*
+                 * Remove original message
+                 * from main queue.
                  */
                 channel.ack(message);
 
-
                 console.log(
-                    "Message acknowledged"
+                    "Message moved to DLQ"
                 );
-
-            } catch (error) {
-
-                console.error(
-                    "Payment processing failed:",
-                    error
-                );
-
-                channel.ack(message);
             }
         }
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| Fake Payment Processing
-|--------------------------------------------------------------------------
-*/
-
-function processPayment(order) {
-
-    return new Promise((resolve) => {
-
-        setTimeout(() => {
-
-            resolve();
-
-        }, 3000);
-
     });
 }
 
 
 /*
-|--------------------------------------------------------------------------
-| Start Worker
-|--------------------------------------------------------------------------
-*/
+ * RabbitMQ adds x-death information
+ * whenever a message is dead-lettered.
+ */
+function getRetryCount(message) {
 
-startWorker().catch((error) => {
+    const xDeath = message.properties.headers?.["x-death"];
 
-    console.error(
-        "Worker failed to start:",
-        error
+    if (!xDeath) {
+        return 0;
+    }
+
+    const mainQueueDeath = xDeath.find(
+        (entry) => entry.queue === MAIN_QUEUE
     );
 
+    return mainQueueDeath
+        ? mainQueueDeath.count
+        : 0;
+}
+
+
+/*
+ * Simulate payment processing.
+ *
+ * For now we intentionally fail
+ * so we can observe retries.
+ */
+function processPayment(order) {
+
+    return new Promise((resolve, reject) => {
+
+        setTimeout(() => {
+
+            reject(
+                new Error("Payment gateway failed")
+            );
+
+        }, 1000);
+
+    });
+}
+
+
+startWorker().catch((error) => {
+    console.error(
+        "Payment Worker failed to start:",
+        error
+    );
 });

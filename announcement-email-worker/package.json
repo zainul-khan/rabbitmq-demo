@@ -1,8 +1,16 @@
 {
+  "name": "announcement-email-worker",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
   "scripts": {
     "start": "nodemon ./src/worker.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
   "dependencies": {
     "amqplib": "^2.2.0",
     "express": "^5.2.1"
