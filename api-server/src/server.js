@@ -27,6 +27,8 @@ const PORT = 3000;
 */
 
 const EXCHANGE_NAME = "orders.exchange";
+const FANOUT_EXCHANGE = "orders.fanout";
+const ANNOUNCEMENT_EXCHANGE = "announcements.exchange";
 
 // Different types of events
 const ROUTING_KEYS = {
@@ -34,6 +36,8 @@ const ROUTING_KEYS = {
     CANCELLED: "order.cancelled",
     COMPLETED: "order.completed",
 };
+
+
 
 
 /*
@@ -72,6 +76,12 @@ app.post("/orders", async (req, res) => {
             }
         );
 
+        await channel.assertExchange(
+            FANOUT_EXCHANGE,
+            "fanout",
+            { durable: true }
+        );
+
         /*
          * ROUTING KEY
          * -----------
@@ -90,6 +100,13 @@ app.post("/orders", async (req, res) => {
             {
                 persistent: true,
             }
+        );
+
+        channel.publish(
+            FANOUT_EXCHANGE,
+            "",
+            Buffer.from(JSON.stringify(order)),
+            { persistent: true }
         );
 
         console.log(
@@ -164,6 +181,49 @@ app.post("/orders/:orderId/cancel", async (req, res) => {
 
         res.status(500).json({
             message: "Failed to cancel order",
+        });
+    }
+});
+
+
+app.post("/announcements", async (req, res) => {
+    try {
+        const { title, message } = req.body;
+
+        const announcement = {
+            id: `ANN-${Date.now()}`,
+            title,
+            message,
+            createdAt: new Date().toISOString(),
+        };
+
+        const channel = getChannel();
+
+        await channel.assertExchange(
+            ANNOUNCEMENT_EXCHANGE,
+            "fanout",
+            { durable: true }
+        );
+
+        channel.publish(
+            ANNOUNCEMENT_EXCHANGE,
+            "",
+            Buffer.from(JSON.stringify(announcement)),
+            { persistent: true }
+        );
+
+        console.log("Announcement published:");
+        console.log(announcement);
+
+        res.status(202).json({
+            message: "Announcement published",
+            announcement,
+        });
+    } catch (error) {
+        console.error(error);
+
+        res.status(500).json({
+            message: "Failed to publish announcement",
         });
     }
 });
